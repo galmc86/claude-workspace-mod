@@ -42,6 +42,23 @@ test('add, list and remove a sibling repo, on every surface', async ($, on) => {
 
     return { value: undefined }
   })
+  on('fs.list', (_, e) => ({
+    value: e.path === '/work/api'
+      ? [
+          { name: '.git', kind: 'dir', size: 0, mtimeMs: 0, isLink: false },
+          { name: 'README.md', kind: 'file', size: 0, mtimeMs: 0, isLink: false },
+          { name: 'src', kind: 'dir', size: 0, mtimeMs: 0, isLink: false },
+        ]
+      : [{ name: 'x.ts', kind: 'file', size: 0, mtimeMs: 0, isLink: false }],
+  }))
+  const filled: string[] = []
+  on('prompt.fill', (_, e) => {
+    filled.push(e.text)
+
+    return { isFilled: true }
+  })
+  on('ui.status', () => ({ value: undefined }))
+  on('env.get', () => ({ value: 'true' }))
   on('process.run', (_, e) => ({
     value: {
       exitCode: 0,
@@ -67,13 +84,33 @@ test('add, list and remove a sibling repo, on every surface', async ($, on) => {
   ).toEqual(['/work/api'])
 
   const status = await $.command.run(typed('status'))
-  expect(status.text).toBe('app: main, clean\napi: feature, +2 -0, 1 changed')
+  expect(status.text).toBe('app: ⎇ main, clean\napi: ⎇ feature, ↑2 ↓0, 1 changed')
 
   for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect((await ui.find({ type: 'Text', text: /feature/ }))?.text).toBe('    feature, +2 -0, 1 changed')
+    expect((await ui.find({ type: 'Text', text: /feature/ }))?.text).toBe('⎇ feature, ↑2 ↓0, 1 changed')
+    expect(await ui.find({ key: 'change:/work/api/src/x.ts' })).toBeDefined()
+
+    // Open the api repo's files, then its src folder, then mention a file.
+    await ui.press({ key: 'files:/work/api' })
+    expect(await ui.find({ key: 'entry:/work/api/.git' })).toBeUndefined()
+    await ui.press({ key: 'entry:/work/api/src' })
+    await ui.press({ key: 'entry:/work/api/src/x.ts' })
+    expect(filled.pop()).toBe('@/work/api/src/x.ts ')
+    await ui.press({ key: 'entry:/work/api/src' })
+    expect(await ui.find({ key: 'entry:/work/api/src/x.ts' })).toBeUndefined()
+    await ui.press({ key: 'files:/work/api' })
+    expect(await ui.find({ key: 'entry:/work/api/src' })).toBeUndefined()
+
+    // Collapsing a repo hides its changes.
+    await ui.press({ key: 'root:/work/api' })
+    expect(await ui.find({ key: 'change:/work/api/src/x.ts' })).toBeUndefined()
+    await ui.press({ key: 'root:/work/api' })
     await ui.unmount()
   }
+
+  const fromMac = await $.command.run(typed('add /Users/me/projects/shelter-finder'))
+  expect(fromMac.text).toMatch(/^\/Users\/me\/projects\/shelter-finder is not on this machine/)
 
   const removed = await $.command.run(typed('remove api'))
   expect(removed.text).toBe('Removed api from the workspace; its files are untouched.')

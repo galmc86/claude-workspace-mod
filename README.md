@@ -15,7 +15,7 @@ In a session opened in that repo, the mod:
 
 - gives the session access to every folder (it adds them to `permissions.additionalDirectories` in `.claude/settings.local.json`, as `/add-dir` does);
 - tells Claude, in the system prompt, to treat the repos as one project: search all of them, run git per repo with `git -C`, and commit and push each repo separately;
-- shows a pane with each repo's branch, ahead/behind count and changed files, refreshed after every turn.
+- shows an explorer pane, like VS Code's: each repo collapses, with its branch (⎇ main ↑1 ↓0), a Changes list in Source Control's letters (M, A, D, R, U) and a file tree you open folder by folder. Pressing a file puts `@path` in the prompt. It refreshes after every turn.
 
 ## Commands
 

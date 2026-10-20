@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { WorkspaceFolder, WorkspaceRoot } from '../types'
+import type { WorkspaceChange, WorkspaceEntry, WorkspaceFolder, WorkspaceRoot } from '../types'
 
 const PANE = 'workspace'
 const CONFIG = '.claude/workspace.json'
@@ -9,6 +9,19 @@ const LOCAL_SETTINGS = '.claude/settings.local.json'
 
 const roots = atom({ plugin: 'workspace', key: 'roots' } as const, [])
 const note = atom({ plugin: 'workspace', key: 'note' } as const, '')
+const closedRoots = atom({ plugin: 'workspace', key: 'closedRoots' } as const, [])
+const openDirs = atom({ plugin: 'workspace', key: 'openDirs' } as const, [])
+const listings = atom({ plugin: 'workspace', key: 'listings' } as const, {})
+
+// The colors VS Code's Source Control gives each letter.
+const CODE_COLORS: Record<string, 'warning' | 'success' | 'error' | 'suggestion'> = {
+  M: 'warning',
+  A: 'success',
+  U: 'success',
+  D: 'error',
+  '!': 'error',
+  R: 'suggestion',
+}
 
 const USAGE = [
   'Usage:',
@@ -110,23 +123,73 @@ async function gitStatus($: EngineInterface, root: WorkspaceRoot): Promise<Works
   let branch: string | undefined
   let ahead = 0
   let behind = 0
-  let changed = 0
+  const changes: WorkspaceChange[] = []
   for (const line of stdout.split('\n')) {
     if (line.startsWith('# branch.head ')) branch = line.slice(14)
     else if (line.startsWith('# branch.ab ')) {
       const [, a = '0', b = '0'] = /\+(\d+) -(\d+)/.exec(line) ?? []
       ahead = Number(a)
       behind = Number(b)
-    } else if (line !== '' && !line.startsWith('#')) changed += 1
+    } else if (line !== '' && !line.startsWith('#')) {
+      const change = parseChange(line)
+      if (change) changes.push(change)
+    }
   }
 
-  return { ...root, isMissing: false, branch, ahead, behind, changed }
+  return { ...root, isMissing: false, branch, ahead, behind, changed: changes.length, changes: changes.slice(0, 100) }
+}
+
+// One `git status --porcelain=v2` entry line, in VS Code's letters.
+function parseChange(line: string): WorkspaceChange | undefined {
+  const fields = line.split(' ')
+  const kind = fields[0]
+  const xy = fields[1] ?? '..'
+  const letter = xy[1] !== '.' ? xy[1] : xy[0]
+  if (kind === '?') return { code: 'U', path: line.slice(2) }
+  if (kind === 'u') return { code: '!', path: fields.slice(10).join(' ') }
+  if (kind === '1') return { code: letter === 'T' ? 'M' : (letter ?? 'M'), path: fields.slice(8).join(' ') }
+  if (kind === '2') return { code: 'R', path: fields.slice(9).join(' ').split('\t')[0] ?? '' }
+
+  return undefined
+}
+
+async function listDir($: EngineInterface, path: string): Promise<WorkspaceEntry[]> {
+  const entries = await $.fs.list(path).catch(() => [])
+
+  return entries
+    .filter(entry => entry.name !== '.git' && entry.kind !== 'other')
+    .map(entry => ({ name: entry.name, isDir: entry.kind === 'dir' }))
+    .sort((a, b) => Number(b.isDir) - Number(a.isDir) || a.name.localeCompare(b.name))
+    .slice(0, 300)
+}
+
+async function toggleDir($: EngineInterface, path: string) {
+  if ((await read($, openDirs)).includes(path)) {
+    await update($, openDirs, list => list.filter(one => one !== path))
+    return
+  }
+  const entries = await listDir($, path)
+  await update($, listings, all => ({ ...all, [path]: entries }))
+  await update($, openDirs, list => [...list, path])
+}
+
+// Files change as the model works: re-read every folder the tree shows.
+async function relistOpenDirs($: EngineInterface) {
+  const open = await read($, openDirs)
+  const fresh = await Promise.all(open.map(async path => [path, await listDir($, path)] as const))
+  await update($, listings, () => Object.fromEntries(fresh))
+}
+
+// `@path` in the prompt is how a file is mentioned, as VS Code's "Add to chat".
+async function mention($: EngineInterface, root: WorkspaceRoot, relative: string) {
+  const path = root.isPrimary ? relative : `${root.path}/${relative}`
+  await $.prompt.fill({ text: `@${path} `, mode: 'insert' })
 }
 
 function describeRoot(root: WorkspaceRoot): string {
   if (root.isMissing) return 'missing (run /workspace sync)'
-  const parts = [root.branch ?? '?']
-  if (root.ahead || root.behind) parts.push(`+${root.ahead} -${root.behind}`)
+  const parts = [`⎇ ${root.branch ?? '?'}`]
+  if (root.ahead || root.behind) parts.push(`↑${root.ahead} ↓${root.behind}`)
   parts.push(root.changed ? `${root.changed} changed` : 'clean')
 
   return parts.join(', ')
@@ -139,7 +202,7 @@ let promptText = ''
 async function load($: EngineInterface): Promise<WorkspaceRoot[]> {
   const folders = await readFolders($, cwd)
   const list: WorkspaceRoot[] = [
-    { name: baseName(cwd), path: cwd, isPrimary: true, isMissing: false, ahead: 0, behind: 0, changed: 0 },
+    { name: baseName(cwd), path: cwd, isPrimary: true, isMissing: false, ahead: 0, behind: 0, changed: 0, changes: [] },
     ...folders.map(one => ({
       name: one.name,
       path: resolvePath(cwd, one.path),
@@ -149,6 +212,7 @@ async function load($: EngineInterface): Promise<WorkspaceRoot[]> {
       ahead: 0,
       behind: 0,
       changed: 0,
+      changes: [],
     })),
   ]
 
@@ -159,6 +223,7 @@ async function refresh($: EngineInterface): Promise<WorkspaceRoot[]> {
   const list = await load($)
   await update($, roots, () => list)
   promptText = composeSection(list)
+  await relistOpenDirs($)
 
   return list
 }
@@ -200,6 +265,8 @@ async function add($: EngineInterface, spec: string, name?: string): Promise<str
   } else if (isRepoSpec(spec)) {
     folder = { name: name ?? repoName(spec), path: `../${repoName(spec)}`, repo: spec }
     message = await clone($, folder)
+  } else if (spec.startsWith('/') && (await $.env.get('CLAUDE_CODE_REMOTE')) === 'true') {
+    return `${spec} is not on this machine: this session runs in a cloud container and cannot see your computer's folders. Add the project by its GitHub repo instead: /workspace add owner/repo`
   } else {
     return `${spec} is neither a folder nor a repo (owner/repo or a git URL).`
   }
@@ -312,23 +379,91 @@ export const register: Register = on => {
     const { Box, Button, Text } = $.ui.resolve(e)
     const list = await read($, roots)
     const said = await read($, note)
+    const closed = await read($, closedRoots)
+    const open = await read($, openDirs)
+    const listed = await read($, listings)
     const hasMissing = list.some(root => root.isMissing)
+    const rows: JSX.Element[] = []
+    const indent = (depth: number) => '  '.repeat(depth)
+
+    // The folder's entries as rows, open folders drawn beneath themselves.
+    const tree = (root: WorkspaceRoot, dir: string, relative: string, depth: number) => {
+      for (const entry of listed[dir] ?? []) {
+        const path = `${dir}/${entry.name}`
+        const rel = relative ? `${relative}/${entry.name}` : entry.name
+        const isOpen = open.includes(path)
+        rows.push(
+          <Button
+            key={`entry:${path}`}
+            plain
+            onPress={() => (entry.isDir ? toggleDir($, path) : mention($, root, rel))}
+          >
+            {indent(depth)}
+            {entry.isDir ? (isOpen ? '▾ ' : '▸ ') : '  '}
+            {entry.isDir ? <Text bold>{entry.name}</Text> : entry.name}
+          </Button>,
+        )
+        if (entry.isDir && isOpen) tree(root, path, rel, depth + 1)
+      }
+    }
+
+    for (const root of list) {
+      const isOpen = !closed.includes(root.path)
+      rows.push(
+        <Button
+          key={`root:${root.path}`}
+          plain
+          onPress={() =>
+            update($, closedRoots, all =>
+              isOpen ? [...all, root.path] : all.filter(one => one !== root.path),
+            )
+          }
+        >
+          <Text bold>
+            {isOpen ? '▾ ' : '▸ '}
+            {root.name}
+            {root.isPrimary ? ' (primary)' : ''}
+          </Text>{' '}
+          <Text dimColor>{describeRoot(root)}</Text>
+        </Button>,
+      )
+      if (!isOpen) continue
+      if (root.isMissing) {
+        rows.push(<Text color="warning">{indent(2)}Not on disk: press Clone missing or run /workspace sync</Text>)
+        continue
+      }
+
+      if (root.changes.length > 0) {
+        rows.push(<Text dimColor>{indent(1)}Changes ({root.changed})</Text>)
+        for (const change of root.changes) {
+          rows.push(
+            <Button key={`change:${root.path}/${change.path}`} plain onPress={() => mention($, root, change.path)}>
+              {indent(2)}
+              <Text color={CODE_COLORS[change.code] ?? 'text'}>{change.code}</Text> {change.path}
+            </Button>,
+          )
+        }
+      }
+
+      const isFilesOpen = open.includes(root.path)
+      rows.push(
+        <Button key={`files:${root.path}`} plain onPress={() => toggleDir($, root.path)}>
+          {indent(1)}
+          {isFilesOpen ? '▾ ' : '▸ '}
+          <Text dimColor>Files</Text>
+        </Button>,
+      )
+      if (isFilesOpen) tree(root, root.path, '', 2)
+    }
 
     return (
       <Box flexDirection="column">
         {list.length < 2 && (
-          <Text dimColor>Only this repo so far. Add one with /workspace add ../other-repo or /workspace add owner/repo</Text>
+          <Text dimColor>Only this repo so far. Add one with /workspace add owner/repo</Text>
         )}
-        {list.map(root => (
-          <Box flexDirection="column" key={root.path}>
-            <Text bold={root.isPrimary}>
-              {root.isPrimary ? '* ' : '  '}
-              {root.name}
-            </Text>
-            <Text dimColor={!root.isMissing && root.changed === 0}>    {describeRoot(root)}</Text>
-          </Box>
-        ))}
+        {rows}
         {said !== '' && <Text dimColor>{said}</Text>}
+        <Text dimColor>Press a file to mention it in the prompt.</Text>
         <Box>
           <Button key="refresh" label="Refresh" onPress={() => refresh($)} />
           {hasMissing && (
