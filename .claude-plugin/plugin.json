@@ -1,0 +1,6 @@
+{
+  "name": "workspace",
+  "version": "0.1.0",
+  "description": "Multi-repo workspace: one session works across several related repos, like a VS Code multi-root workspace",
+  "types": "./types/index.d.ts"
+}

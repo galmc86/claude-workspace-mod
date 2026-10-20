@@ -1,0 +1,5 @@
+{
+  "name": "claude-workspace-mod",
+  "owner": { "name": "galmc86" },
+  "plugins": [{ "name": "workspace", "source": "./" }]
+}
